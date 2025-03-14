@@ -3,12 +3,16 @@ import re
 
 from flask import Flask, render_template, request, session, redirect, url_for
 import random
+from pathlib import Path
 
-app = Flask(__name__,template_folder="../templates")
+
+app = Flask(__name__)
 app.secret_key = str(uuid.uuid4())
+file_path = Path.cwd() / "files" / "jpsc_gs-1.txt"
+print(file_path)
 
 def read_questions():
-    with open(r"flaskAPI\project\Competition_practice\files\jpsc_gs-1.txt", "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         data = [line.strip() for line in f.readlines() if line.strip()]
     
     questions = []
