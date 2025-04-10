@@ -1,114 +1,235 @@
+from flask import Flask, render_template, session, redirect, url_for, request
+import sqlite3, random
+import html
 import uuid
-import re
-
-from flask import Flask, render_template, request, session, redirect, url_for
-import random
 from pathlib import Path
-
+from markupsafe import Markup
+from res.question_insertion import data_insertion
 
 app = Flask(__name__)
-app.secret_key = str(uuid.uuid4())
-file_path = Path.cwd() / "files" / "jpsc_gs-1.txt"
-print(file_path)
+app.secret_key = str(uuid.uuid4())   # Needed for session
 
-def read_questions():
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = [line.strip() for line in f.readlines() if line.strip()]
-    
-    questions = []
-    question = []
-    options = []
-    answer = None
+db_name = "quiz.db"
+file_name = "jpsc_gs.csv"
 
-    options_start = False
+db_path = Path.cwd() / "data"
+if not db_path.exists():
+    db_path.mkdir(parents=True,exist_ok=True)
 
-    for line in data:
-        if re.match(r"^\d+\.", line):               # Detect question number (e.g., "1.")
-            if question and options and answer:
-                full_question = "\n".join(question)
-                # Remove question number using regex
-                clean_question = re.sub(r"^\d+\.\s*", "", full_question)
-                questions.append({
-                    "id": len(questions) + 1,
-                    "question": clean_question,
-                    "options": options,
-                    "answer": answer
-                })
-            question = [line]
-            options = []
-            answer = None
-            options_start = False
-        
-        elif line.startswith("(A)"):
-            options_start = True
-            options.append(line)
-        
-        elif options_start and line.startswith(("(B)", "(C)", "(D)")):
-            options.append(line)
-        
-        elif line.startswith("Answer:"):
-            answer = line.split("Answer: ")[-1].strip()
-        
-        else:
-            question.append(line)
+DATABASE = Path.cwd() / "data" / db_name
+csv_path = Path.cwd()/ "files" /file_name
 
-    if question and options and answer:
-        full_question = "\n".join(question)
-        clean_question = re.sub(r"^\d+\.\s*","",full_question)
-        questions.append({
-            "id": len(questions) + 1,
-            "question": clean_question,
-            "options": options,
-            "answer": answer
-        })
 
-    return questions
+def check_and_load_data(db_path,csv_path):
 
-questions = read_questions()
+    # Check if 'questions' table is empty or not
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-def reset_quiz():
-    session['score'] = 0
-    session['asked_questions'] = []
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'")
+    table_exists = cursor.fetchone()
+
+    if table_exists:
+        cursor.execute("SELECT COUNT(*) FROM questions")
+        row_count = cursor.fetchone()[0]
+    else:
+        row_count = 0
+
+    conn.close()
+
+    # If no rows exist, load the data from CSV
+    if row_count == 0:
+        print("No data found in DB, inserting now...")
+        data_insertion(db_path, csv_path)
+    else:
+        print(f"Database already has {row_count} questions. Skipping insertion.")
+
+# Run it on app start
+check_and_load_data(DATABASE,csv_path)
+
+
+# Custom filter to escape HTML and add <br> for newlines
+def safe_nl2br(value):
+    escaped = html.escape(value)          # Escapes <, >, ", etc.
+    with_br = escaped.replace("\n", "<br>")
+    return Markup(with_br)                # Only <br> is rendered as HTML
+
+# Register the filter
+app.jinja_env.filters['safe_nl2br'] = safe_nl2br
+
+# Utility: Fetch all question IDs
+def get_all_question_ids():
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM questions")
+    ids = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return ids
+
+# Utility: Fetch a single question by ID
+def get_question_by_id(q_id):
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT question_number, question_text, option_a, option_b, option_c, option_d, correct_option
+        FROM questions WHERE id = ?
+    """, (q_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 @app.route('/')
-def get_question():
-    if 'score' not in session:
-        session['score'] = 0  # Initialize score
-    if 'asked_questions' not in session:
-        session['asked_questions'] = []  # Track asked questions
-    
-    # Select a random question that hasn't been asked
-    available_questions = [q for q in questions if q['id'] not in session['asked_questions']]
-    
-    
-    if not available_questions:
-        return redirect(url_for('final_score'))
+def home():
+    return render_template("home.html")
 
-    selected_question = random.choice(available_questions)
-    session['asked_questions'].append(selected_question['id'])
-    session.modified = True  # Ensure the session is saved   
-    
-    return render_template("index.html", question=selected_question, score=session['score'])
+@app.route('/start')
+def start_quiz():
+    # session.clear()         # ... rest of the quiz start logic
+    # Get all question IDs and shuffle
+    question_ids = get_all_question_ids()
+    random.shuffle(question_ids)
 
-@app.route('/submit', methods=['POST'])
-def submit():
-    selected_answer = request.form.get("answer", "")
-    correct_answer = request.form.get("correct_answer", "")
+    # Initialize session
+    session['question_ids'] = question_ids
+    session['responses'] = {}  # track answers
+    return redirect(url_for('show_question', question_index=0))
 
-    if selected_answer == correct_answer:
-        session['score'] += 1  # Increase score if the answer is correct
+@app.route('/quiz/<int:question_index>', methods=['GET', 'POST'])
+def show_question(question_index):
+    question_ids = session.get('question_ids')
+    responses = session.get('responses', {})
 
-    return redirect(url_for('get_question'))  # Redirect to the next question
+    if not question_ids or question_index < 0 or question_index >= len(question_ids):
+        return redirect(url_for('start_quiz'))
+
+    qid = question_ids[question_index]
+    question = get_question_by_id(qid)
+
+    selected_option = responses.get(str(qid))
+
+    if request.method == 'POST':
+        selected_option = request.form.get('option')
+
+        if selected_option != "":
+            responses[str(qid)] = selected_option
+        else:
+            responses.pop(str(qid), None)
+
+        session['responses'] = responses
+
+        # Check if the user came from review page
+        return_to_review = request.args.get('from_review')
+        action = request.form['action']
+
+        if return_to_review == '1':
+            return redirect(url_for('review'))
+
+        if action == 'next':
+            return redirect(url_for('show_question', question_index=question_index + 1))
+        elif action == 'prev':
+            return redirect(url_for('show_question', question_index=question_index - 1))
+        elif action == 'review':
+            return redirect(url_for('review'))
+        elif action == 'finish':
+            return redirect(url_for('final_score'))
+
+    return render_template('quiz.html',
+                           question=question,
+                           index=question_index,
+                           total=len(question_ids),
+                           selected=selected_option)
+
+
+@app.route('/review')
+def review():
+    question_ids = session.get('question_ids')
+    responses = session.get('responses', {})
+
+    if not question_ids:
+        return redirect(url_for('start_quiz'))
+
+    review_data = []
+
+    for idx, qid in enumerate(question_ids):
+        question = get_question_by_id(qid)
+        selected = responses.get(str(qid))
+        review_data.append({
+            'index': idx,           # <- for edit button
+            'number': idx + 1,
+            'question': question[1],
+            'options': {
+                'A': question[2],
+                'B': question[3],
+                'C': question[4],
+                'D': question[5],
+            },
+            'selected': selected
+        })
+
+    return render_template('review.html', review_data=review_data)
 
 @app.route('/final_score')
 def final_score():
+    question_ids = session.get('question_ids')
+    responses = session.get('responses', {})
 
-    score_message = f"Quiz completed! Your final score is {session['score']}/{len(questions)}"
-    
-    # Reset the quiz when the final score is viewed
-    reset_quiz()
+    if not question_ids:
+        return redirect(url_for('start_quiz'))
 
-    return render_template("final_score.html", score_message=score_message)
+    review_data = []
+    score = 0.0  # Make it float for fractional deductions
+
+    for idx, qid in enumerate(question_ids):
+        question = get_question_by_id(qid)
+        selected = responses.get(str(qid))
+        correct = question[6]
+
+        if selected == correct:
+            is_correct = True
+            score += 1
+        elif selected is None or selected == "":
+            is_correct = None  # Skipped
+        else:
+            is_correct = False
+            score -= 0.25
+
+        review_data.append({
+            'index': idx,
+            'question': question[1],
+            'options': {
+                'A': question[2],
+                'B': question[3],
+                'C': question[4],
+                'D': question[5],
+            },
+            'correct': correct,
+            'selected': selected,
+            'is_correct': is_correct,
+        })
+
+    total = len(question_ids)
+    percentage = max((score / total) * 100, 0)
+
+    # Performance based on percentage
+    if percentage == 100:
+        performance = "Outstanding"
+    elif percentage >= 80:
+        performance = "Excellent"
+    elif percentage >= 60:
+        performance = "Good"
+    elif percentage >= 40:
+        performance = "Needs Improvement"
+    else:
+        performance = "Try Again"
+
+    return render_template('final_score.html',
+                           review_data=review_data,
+                           score=round(score, 2),
+                           total=total,
+                           percentage=round(percentage, 2),
+                           performance=performance)
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)
